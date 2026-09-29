@@ -104,7 +104,7 @@ const ReadTextFileArgsSchema = z.object({
     .optional().describe('0-indexed UTF-16 offset applied to startLine only. Defaults to 0.'),
   maxSize: z.number().int().min(0, 'maxSize must be >= 0; omit it to use the 25000 default')
     .max(25000, 'maxSize must be <= 25000')
-    .optional().describe('Maximum UTF-16 units of line content to return (0-25000, default 25000); line terminators are not counted.')
+    .optional().describe('Maximum UTF-16 units of line content to return (0-25000, default 25000)')
 });
 
 const ReadMediaFileArgsSchema = z.object({
@@ -206,33 +206,22 @@ server.registerTool(
   {
     title: "Read Text File",
     description: [
-      "Read one text file inside the allowed directories and return its contents as JSON. Use",
-      "read_multiple_files for several files at once, and read_media_file for images or audio.",
+      "Read one text file inside the allowed directories. Use read_multiple_files for several",
+      "files at once, and read_media_file for images or audio.",
       "",
-      "Result (a JSON object):",
-      "- fileSize: size of the file in bytes.",
-      "- totalLines: lines in the whole file; an empty file counts 1 empty line, a trailing",
-      "  newline adds a trailing empty line.",
-      "- lineEnding: \"LF\", \"CRLF\" or \"Mixed\", from the returned range only; absent if none seen.",
-      "- lines: an OBJECT, not an array - ABSOLUTE 1-indexed line numbers as decimal string keys",
-      "  mapped to each line's text without its terminator. Empty (zero-length) lines are omitted",
-      "  and their absolute 1-indexed numbers listed in emptyLines instead, so concatenating",
-      "  lines cannot rebuild the file; in the returned range a missing line number therefore",
-      "  means an empty line, and lines itself is omitted when nothing was recorded.",
-      "- truncatedAt { line, col, lineLength } plus next { startLine, startCol }: truncatedAt is",
-      "  set when maxSize cut the payload short (1-indexed line, 0-indexed column of the stop, full",
-      "  length of that line); pass next straight back into the next call to resume exactly",
-      "  there, repeating until next is absent.",
-      "- note: set when the result needs explaining, e.g. startLine past the end of the file, or",
-      "  a NUL byte in the first 64 KB (probably binary; bytes are always decoded as UTF-8 and may",
-      "  be garbled - use read_media_file).",
+      "Result: a key-value header (fileSize, totalLines, plus truncatedAt/next/note when",
+      "relevant), then content: each line as an ABSOLUTE 1-indexed number followed by '|' and",
+      "the line's text, preserving original line breaks (empty lines included).",
+      "- truncatedAt { line, col, lineLength } + next { startLine, startCol }: set when maxSize",
+      "  cut the payload short; pass next back verbatim to resume, until next is absent. col and",
+      "  lineLength count the line terminator too, so a stop can land inside CRLF; resuming from",
+      "  there yields a line number with no text.",
+      "- note: why the result needs explaining, e.g. startLine past EOF or a binary file.",
       "",
-      "Param note: maxSize (1-25000, default 25000) counts UTF-16 units of line content without",
-      "terminators and only caps the payload - the file is still scanned to EOF, so totalLines is",
-      "exact. Other params are documented by inputSchema; prefer ranges over reading huge files.",
-      "",
-      "Errors come back as tool errors: path outside the allowed directories, missing, a directory",
-      "(use list_directory for directories), or endLine < startLine."
+      "maxSize (0-25000, default 25000) counts UTF-16 units of line content with terminators and",
+      "only caps the payload; the file is still scanned to EOF, so totalLines is exact. Prefer",
+      "ranges over huge files. Errors: path outside allowed dirs, missing, a directory, or",
+      "endLine < startLine."
     ].join('\n'),
     inputSchema: ReadTextFileArgsSchema,
     annotations: { readOnlyHint: true, openWorldHint: false }
@@ -244,9 +233,16 @@ server.registerTool(
       throw new Error("endLine must be greater than or equal to startLine");
 
     const result = await readFile(validPath, args);
+    let text = `fileSize: ${result.fileSize}\ntotalLines: ${result.totalLines}\n`;
+    const JsonStringifyWithoutKeyQuotes = (obj: unknown) => JSON.stringify(obj).replace(/"([^"]+)"\s*:/g, ' $1: ').replace(/}/, ' }');
+    if (result.truncatedAt)
+      text += `truncatedAt: ${JsonStringifyWithoutKeyQuotes(result.truncatedAt)}\nnext: ${JsonStringifyWithoutKeyQuotes(result.next)}\n`;
+    if (result.note)
+      text += `note: ${result.note}\n`;
+    text += `content:\n${result.lines.map((line, i) => `${i + (args.startLine ?? 1)}|${line}`).join('')}`;
 
     return {
-      content: [{ type: "text" as const, text: JSON.stringify(result) }]
+      content: [{ type: "text" as const, text }]
     };
   }
 );

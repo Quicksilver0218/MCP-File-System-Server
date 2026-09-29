@@ -203,8 +203,6 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 export interface FileReadResult extends Record<string, unknown> {
   fileSize: number;
   totalLines: number;
-  lineEnding?: 'LF' | 'CRLF' | 'Mixed';
-  lines?: Record<number, string>;
   truncatedAt?: {
     line: number;
     col: number;
@@ -214,8 +212,8 @@ export interface FileReadResult extends Record<string, unknown> {
     startLine: number;
     startCol: number;
   };
-  emptyLines?: number[];
   note?: string;
+  lines: string[];
 }
 
 export async function readFile(
@@ -230,13 +228,11 @@ export async function readFile(
     const decoder = new TextDecoder();
     let offset = 0;
     let lineCount = 1;
-    let lineEnding: 'LF' | 'CRLF' | 'Mixed' | undefined;
     let textLength = 0;
-    const lines: Record<number, string> = Object.create(null);
-    const emptyLines = [];
     let truncatedAt;
     let truncated = false;
     const notes = [];
+    const lines = [];
 
     // Read chunks and count lines until we have enough or reach EOF
     let lineLength = 0;
@@ -267,16 +263,7 @@ export async function readFile(
           const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split('\n');
           for (let line of completeLines) {
             if (lineCount >= startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
-              if (line.endsWith('\r')) {
-                line = line.slice(0, -1);
-                if (!lineEnding)
-                  lineEnding = 'CRLF';
-                else if (lineEnding !== 'CRLF')
-                  lineEnding = 'Mixed';
-              } else if (!lineEnding)
-                lineEnding = 'LF';
-              else if (lineEnding !== 'LF')
-                lineEnding = 'Mixed';
+              line += '\n';
               lineLength = line.length;
               let colOffset;
               if (lineCount === startLine && startCol) {
@@ -304,17 +291,14 @@ export async function readFile(
                 };
                 truncated = true;
               }
-              if (lineLength)
-                lines[lineCount] = line;
-              else
-                emptyLines.push(lineCount);
+              lines.push(line);
               textLength += line.length;
             }
             lineCount++;
           }
         } else {
           if (textLength >= maxSize && !truncated) {
-            lineLength += firstLineBreakPos!;
+            lineLength += firstLineBreakPos! + 1;
             if (truncatedAt)
               truncatedAt.lineLength = lineLength;
             else {
@@ -362,7 +346,7 @@ export async function readFile(
         textLength += remainingText.length;
         if (textLength > maxSize + colOffset) {
           pendingLine = pendingLine.slice(colOffset, maxSize + colOffset - textLength);
-          lines[lineCount] = pendingLine;
+          lines.push(pendingLine);
           truncatedAt = {
             line: lineCount,
             col: colOffset + pendingLine.length,
@@ -378,25 +362,17 @@ export async function readFile(
         truncatedAt.lineLength = lineLength;
     } else if (lineCount >= startLine && (!endLine || lineCount <= endLine)) {
       // If there is leftover content and we still need lines, add it
-      if (pendingLine)
-        if (lineCount === startLine && startCol)
-          lines[lineCount] = pendingLine.slice(startCol);
-        else
-          lines[lineCount] = pendingLine;
+      if (lineCount === startLine && startCol)
+        lines.push(pendingLine.slice(startCol));
       else
-        emptyLines.push(lineCount);
+        lines.push(pendingLine);
     }
 
     const result: FileReadResult = {
       fileSize: offset,
-      totalLines: lineCount
+      totalLines: lineCount,
+      lines
     };
-    if (lineEnding)
-      result.lineEnding = lineEnding;
-    for (const _ in lines) {
-      result.lines = lines;
-      break;
-    }
     if (truncatedAt) {
       result.truncatedAt = {
         line: truncatedAt.line,
@@ -408,8 +384,6 @@ export async function readFile(
         startCol: truncatedAt.nextCol
       };
     }
-    if (emptyLines.length)
-      result.emptyLines = emptyLines;
     if (startLine > lineCount)
       notes.push(`startLine (${startLine}) is greater than totalLines (${lineCount}).`);
     if (notes.length)
