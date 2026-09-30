@@ -229,7 +229,7 @@ export async function readFile(
     let offset = 0;
     let lineCount = 1;
     let textLength = 0;
-    let truncatedAt;
+    let truncatedAt: Record<string, number> | undefined;
     let truncated = false;
     const notes = [];
     const lines = [];
@@ -245,7 +245,6 @@ export async function readFile(
         if (nullPos !== -1)
           notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled - use read_media_file for images or audio.`);
       }
-      offset += result.bytesRead;
       const text = decoder.decode(bytes);
 
       let chunkLineCount = 0;
@@ -305,22 +304,18 @@ export async function readFile(
               let col = pendingLine.length;
               if (lineCount === startLine && startCol)
                 col += startCol;
-              if (firstLineBreakPos)
-                truncatedAt = {
-                  line: lineCount,
-                  col,
-                  lineLength,
-                  nextLine: lineCount,
-                  nextCol: col
-                };
-              else
-                truncatedAt = {
-                  line: lineCount,
-                  col,
-                  lineLength,
-                  nextLine: lineCount + 1,
-                  nextCol: 0
-                };
+              truncatedAt = {
+                line: lineCount,
+                col,
+                lineLength,
+              };
+              if (firstLineBreakPos) {
+                truncatedAt.nextLine = lineCount;
+                truncatedAt.nextCol = col;
+              } else {
+                truncatedAt.nextLine = lineCount + 1;
+                truncatedAt.nextCol = 0;
+              }
             }
             truncated = true;
           }
@@ -355,6 +350,7 @@ export async function readFile(
           };
         }
       }
+      offset += result.bytesRead;
     }
 
     if (truncatedAt) {
@@ -391,6 +387,184 @@ export async function readFile(
     return result;
   } finally {
     await fileHandle.close();
+  }
+}
+
+export interface FileEditResult {
+  modified: { line: number, text: string }[];
+  note?: string;
+}
+
+export async function editFile(
+  filePath: string,
+  edits: { line: number, col?: number, text?: string, deleteCount?: number }[],
+  dryRun?: boolean
+): Promise<FileEditResult> {
+  if (await fs.stat(filePath).then(s => !s.isFile()))
+    throw new Error(`File (${filePath}) does not exist or is not a file`);
+  const fileHandle = await fs.open(filePath, 'r+');
+  let outFileSuffix = 0;
+  try {
+    while (true) {
+      await fs.access(`${filePath}${outFileSuffix}`, fs.constants.F_OK);
+      outFileSuffix++;
+    }
+  } catch { }
+  let outFileHandle;
+  try {
+    if (!dryRun)
+      outFileHandle = await fs.open(`${filePath}${outFileSuffix}`, 'a');
+    const editMap = new Map(edits.map(e => [e.line, e]));
+    let pendingLine = '';
+    const chunk = Buffer.alloc(65536); // 64KB buffer
+    const decoder = new TextDecoder();
+    let offset = 0;
+    let lineCount = 1;
+    const notes = [];
+    const modified: { line: number, text: string }[] = [];
+
+    const formatColAndDeleteCount = (lineLength: number, isLastLine: boolean, col?: number, deleteCount?: number) => {
+      if (col) {
+        if (col > lineLength || col === lineLength && !isLastLine)
+          throw new Error(`Edit column ${col} is out of bounds for line ${lineCount}`);
+        else if (col < 0) {
+          const oCol = col;
+          col += lineLength;
+          if (col < 0)
+            throw new Error(`Edit column ${oCol} is out of bounds for line ${lineCount}`);
+        }
+      } else
+        col = 0;
+      if (deleteCount) {
+        if (deleteCount < 0) {
+          const oDeleteCount = deleteCount;
+          deleteCount += lineLength - col;
+          if (deleteCount < 0)
+            throw new Error(`Edit deleteCount ${oDeleteCount} is out of negative bound for line ${lineCount}`);
+        }
+      } else
+        deleteCount = 0;
+      return { col, deleteCount };
+    };
+
+    let hasEditLine = false;
+    let maxLine = 0;
+    for (const lineNumber of editMap.keys()) {
+      if (!hasEditLine && lineNumber === 1)
+        hasEditLine = true;
+      if (lineNumber > maxLine)
+        maxLine = lineNumber;
+    }
+    while (true) {
+      const result = await fileHandle.read(chunk, 0, chunk.length, offset);
+      if (result.bytesRead === 0) break; // End of file
+      const bytes = chunk.subarray(0, result.bytesRead);
+      if (!offset) {
+        const nullPos = bytes.indexOf(0);
+        if (nullPos !== -1)
+          notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled - use read_media_file for images or audio.`);
+      }
+      const text = decoder.decode(bytes);
+
+      let chunkLineCount = 0;
+      let firstLineBreakPos, lastLineBreakPos;
+      for (let i = 0; i < text.length; i++)
+        if (text[i] === '\n') {
+          chunkLineCount++;
+          if (firstLineBreakPos === undefined)
+            firstLineBreakPos = i;
+          lastLineBreakPos = i;
+        }
+      if (chunkLineCount) {
+        hasEditLine = false;
+        for (const lineNumber of editMap.keys())
+          if (lineCount <= lineNumber && lineCount + chunkLineCount > lineNumber) {
+            hasEditLine = true;
+            break;
+          }
+        if (hasEditLine) {
+          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split('\n');
+          for (let line of completeLines) {
+            line += '\n';
+            if (editMap.has(lineCount)) {
+              const edit = editMap.get(lineCount)!;
+              let newLine = '';
+              const { col, deleteCount } = formatColAndDeleteCount(line.length, false, edit.col, edit.deleteCount);
+              newLine = line.slice(0, col);
+              if (edit.text)
+                newLine += edit.text;
+              newLine += line.slice(col + deleteCount);
+              modified.push({ line: lineCount, text: newLine });
+              if (outFileHandle)
+                await outFileHandle.appendFile(newLine);
+            } else if (outFileHandle)
+              await outFileHandle.appendFile(line);
+            lineCount++;
+          }
+          hasEditLine = false;
+        } else {
+          lineCount += chunkLineCount;
+          if (outFileHandle)
+            await outFileHandle.appendFile(text.slice(0, lastLineBreakPos! + 1));
+        }
+        for (const lineNumber of editMap.keys())
+          if (lineCount === lineNumber) {
+            hasEditLine = true;
+            break;
+          }
+        pendingLine = text.slice(lastLineBreakPos! + 1);
+        if (!hasEditLine) {
+          if (outFileHandle)
+            await outFileHandle.appendFile(pendingLine);
+          pendingLine = '';
+        }
+      } else {
+        if (hasEditLine)
+          pendingLine += text;
+        else if (outFileHandle)
+          await outFileHandle.appendFile(bytes);
+      }
+      offset += result.bytesRead;
+    }
+    if (hasEditLine) {
+      const edit = editMap.get(lineCount)!;
+      let newLine = '';
+      const { col, deleteCount } = formatColAndDeleteCount(pendingLine.length, true, edit.col, edit.deleteCount);
+      newLine = pendingLine.slice(0, col);
+      if (edit.text)
+        newLine += edit.text;
+      newLine += pendingLine.slice(col + deleteCount);
+      modified.push({ line: lineCount, text: newLine });
+      if (outFileHandle)
+        await outFileHandle.appendFile(newLine);
+    }
+    if (maxLine > lineCount)
+      notes.push(`The inputted lines with the line number greater than the total lines (${lineCount}) are not processed.`);
+    const output: FileEditResult = { modified };
+    if (notes.length)
+      output.note = notes.join('\n');
+
+    await fileHandle.close();
+    if (outFileHandle) {
+      await outFileHandle.close();
+      await fs.rename(filePath, `${filePath}.bak`);
+      try {
+        await fs.rename(`${filePath}${outFileSuffix}`, filePath);
+        try {
+          await fs.rm(`${filePath}.bak`);
+        } catch { }
+      } catch (e) {
+        await fs.rename(`${filePath}.bak`, filePath);
+        throw e;
+      }
+    }
+    return output;
+  } finally {
+    await fileHandle.close();
+    if (outFileHandle) {
+      await outFileHandle.close();
+      await fs.rm(`${filePath}${outFileSuffix}`, { force: true });
+    }
   }
 }
 

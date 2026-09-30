@@ -24,6 +24,7 @@ import {
   searchFilesWithValidation,
   applyFileEdits,
   setAllowedDirectories,
+  editFile,
 } from './lib.js';
 
 // Command line argument parsing
@@ -105,6 +106,26 @@ const ReadTextFileArgsSchema = z.object({
   maxSize: z.number().int().min(0, 'maxSize must be >= 0; omit it to use the 25000 default')
     .max(25000, 'maxSize must be <= 25000')
     .optional().describe('Maximum UTF-16 units of line content to return (0-25000, default 25000)')
+});
+
+const EditTextFileArgsSchema = z.object({
+  path: z.string().describe(
+    'Path of the file to edit. Absolute paths are preferred; relative paths are resolved ' +
+    'against the allowed directories. Must resolve inside an allowed directory.'
+  ),
+  edits: z.array(z.object({
+    line: z.number().int().min(1, 'line must be >= 1 (lines are 1-indexed)').describe('1-indexed line number to edit'),
+    col: z.number().int().optional().describe(
+      '0-indexed UTF-16 offset applied to the line. Negative index counts back ' +
+      'from the end of the line (including line breaks). Defaults to 0.'
+    ),
+    text: z.string().optional().describe('New text to insert at the given position. Optional.'),
+    deleteCount: z.number().int().optional().describe(
+      'Number of characters to delete at the given position. Negative index counts back ' +
+      'from the end of the line (including line breaks). Defaults to 0.'
+    )
+  })).describe('Edits to apply to the file. Only one edit per line is allowed.'),
+  dryRun: z.boolean().optional().describe('If true, do not actually write the file.')
 });
 
 const ReadMediaFileArgsSchema = z.object({
@@ -240,6 +261,31 @@ server.registerTool(
     if (result.note)
       text += `note: ${result.note}\n`;
     text += `content:\n${result.lines.map((line, i) => `${i + (args.startLine ?? 1)}|${line}`).join('')}`;
+
+    return {
+      content: [{ type: "text" as const, text }]
+    };
+  }
+);
+
+server.registerTool(
+  "edit_text_file",
+  {
+    title: "Edit Text File",
+    description:
+      "Apply line-based edits (insert text and/or delete deleteCount chars) to a text file; " +
+      "lines past EOF are skipped. " +
+      "Result: modified lines as <line_number>|<json_escaped_text>, plus note when relevant.",
+    inputSchema: EditTextFileArgsSchema,
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof EditTextFileArgsSchema>) => {
+    const validPath = await validatePath(args.path);
+
+    const result = await editFile(validPath, args.edits, args.dryRun);
+    let text = `modified:\n${result.modified.sort((a, b) => a.line - b.line).map(item => `${item.line}|${JSON.stringify(item.text).slice(1, -1)}`).join('\n')}`;
+    if (result.note)
+      text += `\nnote: ${result.note}`;
 
     return {
       content: [{ type: "text" as const, text }]
