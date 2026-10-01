@@ -36,4 +36,21 @@ export default {
       entryOnly: true,
     }),
   ],
+  module: {
+    rules: [
+      {
+        test: /\.ts$/,
+        loader: 'ts-loader',
+        options: {
+          transpileOnly: true, 
+        },
+      },
+    ],
+  },
+  resolve: {
+    extensions: ['.ts', '.js'],
+    extensionAlias: {
+      '.js': ['.ts', '.js']
+    }
+  }
 };

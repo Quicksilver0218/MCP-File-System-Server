@@ -420,7 +420,8 @@ export async function editFile(
   edits: { line: number, delete?: boolean, col?: number | 'end', text?: string, deleteText?: string | number | boolean }[],
   dryRun?: boolean
 ): Promise<FileEditResult> {
-  if (await fs.stat(filePath).then(s => !s.isFile()))
+  const origStats = await fs.stat(filePath);
+  if (!origStats.isFile())
     throw new Error(`File (${filePath}) does not exist or is not a file`);
   const editMap = new Map(edits.map(e => [e.line, e]));
   if (editMap.size !== edits.length)
@@ -615,6 +616,9 @@ export async function editFile(
       await fs.rename(filePath, `${filePath}.bak`);
       try {
         await fs.rename(`${filePath}${outFileSuffix}`, filePath);
+        try {
+          await fs.chmod(filePath, origStats.mode & 0o777);
+        } catch { }
         try {
           await fs.rm(`${filePath}.bak`);
         } catch { }
