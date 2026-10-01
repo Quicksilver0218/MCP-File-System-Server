@@ -203,6 +203,7 @@ export async function readFileContent(filePath: string, encoding: string = 'utf-
 export interface FileReadResult extends Record<string, unknown> {
   fileSize: number;
   totalLines: number;
+  lineEnding?: '\r' | '\n' | '\r\n' | 'Mixed';
   truncatedAt?: {
     line: number;
     col: number;
@@ -221,6 +222,9 @@ export async function readFile(
   options: { startLine?: number; endLine?: number, startCol?: number; maxSize?: number } = {}
 ): Promise<FileReadResult> {
   const { startLine = 1, endLine, startCol, maxSize = 25000 } = options;
+  if (endLine && endLine < startLine)
+    throw new Error("endLine must be greater than or equal to startLine");
+
   const fileHandle = await fs.open(filePath, 'r');
   try {
     let pendingLine = '';
@@ -228,6 +232,7 @@ export async function readFile(
     const decoder = new TextDecoder();
     let offset = 0;
     let lineCount = 1;
+    let lineEnding: '\r' | '\n' | '\r\n' | 'Mixed' | undefined;
     let textLength = 0;
     let truncatedAt: Record<string, number> | undefined;
     let truncated = false;
@@ -250,7 +255,7 @@ export async function readFile(
       let chunkLineCount = 0;
       let firstLineBreakPos, lastLineBreakPos;
       for (let i = 0; i < text.length; i++)
-        if (text[i] === '\n') {
+        if (text[i] === '\n' && text[i - 1] !== '\r' || text[i] === '\r') {
           chunkLineCount++;
           if (firstLineBreakPos === undefined)
             firstLineBreakPos = i;
@@ -259,45 +264,54 @@ export async function readFile(
       let remainingText;
       if (chunkLineCount) {
         if (lineCount + chunkLineCount > startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
-          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split('\n');
-          for (let line of completeLines) {
-            if (lineCount >= startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
-              line += '\n';
-              lineLength = line.length;
-              let colOffset;
-              if (lineCount === startLine && startCol) {
-                line = line.slice(startCol);
-                colOffset = startCol;
-              } else
-                colOffset = 0;
-              if (textLength + line.length > maxSize) {
-                line = line.slice(0, maxSize - textLength);
-                truncatedAt = {
-                  line: lineCount,
-                  col: colOffset + line.length,
-                  lineLength,
-                  nextLine: lineCount,
-                  nextCol: colOffset + line.length,
-                };
-                truncated = true;
-              } else if (textLength + line.length === maxSize) {
-                truncatedAt = {
-                  line: lineCount,
-                  col: colOffset + line.length,
-                  lineLength,
-                  nextLine: lineCount + 1,
-                  nextCol: 0,
-                };
-                truncated = true;
+          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split(/(\r\n|\r|\n)/);
+          for (let i = 0; i < completeLines.length; i++) {
+            if (i & 1) {
+              if (lineEnding !== 'Mixed')
+                if (lineEnding) {
+                  if (completeLines[i] !== lineEnding)
+                    lineEnding = 'Mixed';
+                } else
+                  lineEnding = completeLines[i] as '\r' | '\n' | '\r\n';
+            } else {
+              let line = completeLines[i];
+              if (lineCount >= startLine && (!endLine || lineCount <= endLine) && textLength < maxSize) {
+                lineLength = line.length;
+                let colOffset;
+                if (lineCount === startLine && startCol) {
+                  line = line.slice(startCol);
+                  colOffset = startCol;
+                } else
+                  colOffset = 0;
+                if (textLength + line.length > maxSize) {
+                  line = line.slice(0, maxSize - textLength);
+                  truncatedAt = {
+                    line: lineCount,
+                    col: colOffset + line.length,
+                    lineLength,
+                    nextLine: lineCount,
+                    nextCol: colOffset + line.length,
+                  };
+                  truncated = true;
+                } else if (textLength + line.length === maxSize) {
+                  truncatedAt = {
+                    line: lineCount,
+                    col: colOffset + line.length,
+                    lineLength,
+                    nextLine: lineCount + 1,
+                    nextCol: 0,
+                  };
+                  truncated = true;
+                }
+                lines.push(line);
+                textLength += line.length;
               }
-              lines.push(line);
-              textLength += line.length;
+              lineCount++;
             }
-            lineCount++;
           }
         } else {
           if (textLength >= maxSize && !truncated) {
-            lineLength += firstLineBreakPos! + 1;
+            lineLength += firstLineBreakPos!;
             if (truncatedAt)
               truncatedAt.lineLength = lineLength;
             else {
@@ -321,7 +335,7 @@ export async function readFile(
           }
           lineCount += chunkLineCount;
         }
-        remainingText = text.slice(lastLineBreakPos! + 1);
+        remainingText = text.slice(lastLineBreakPos! + 1).replace('\n', '');
         lineLength = remainingText.length;
       } else {
         remainingText = text;
@@ -369,6 +383,8 @@ export async function readFile(
       totalLines: lineCount,
       lines
     };
+    if (lineEnding)
+      result.lineEnding = lineEnding;
     if (truncatedAt) {
       result.truncatedAt = {
         line: truncatedAt.line,
@@ -391,18 +407,26 @@ export async function readFile(
 }
 
 export interface FileEditResult {
-  modified: { line: number, text: string }[];
+  modified: {
+    type: '+' | '-';
+    line: number;
+    text: string;
+  }[];
   note?: string;
 }
 
 export async function editFile(
   filePath: string,
-  edits: { line: number, col?: number, text?: string, deleteCount?: number }[],
+  edits: { line: number, delete?: boolean, col?: number | 'end', text?: string, deleteText?: string | number | boolean }[],
   dryRun?: boolean
 ): Promise<FileEditResult> {
   if (await fs.stat(filePath).then(s => !s.isFile()))
     throw new Error(`File (${filePath}) does not exist or is not a file`);
+  const editMap = new Map(edits.map(e => [e.line, e]));
+  if (editMap.size !== edits.length)
+    throw new Error(`Duplicate line numbers found in edits`);
   const fileHandle = await fs.open(filePath, 'r+');
+
   let outFileSuffix = 0;
   try {
     while (true) {
@@ -412,48 +436,52 @@ export async function editFile(
   } catch { }
   let outFileHandle;
   try {
-    if (!dryRun)
-      outFileHandle = await fs.open(`${filePath}${outFileSuffix}`, 'a');
-    const editMap = new Map(edits.map(e => [e.line, e]));
-    let pendingLine = '';
     const chunk = Buffer.alloc(65536); // 64KB buffer
     const decoder = new TextDecoder();
+    if (!dryRun)
+      outFileHandle = await fs.open(`${filePath}${outFileSuffix}`, 'a');
+    let pendingLine = '';
     let offset = 0;
-    let lineCount = 1;
+    let srcLineCount = 1, distLineCount = 1;
     const notes = [];
-    const modified: { line: number, text: string }[] = [];
+    const modified: { type: '+' | '-', line: number, text: string }[] = [];
 
-    const formatColAndDeleteCount = (lineLength: number, isLastLine: boolean, col?: number, deleteCount?: number) => {
+    const formatColAndDeleteCount = (lineLength: number, col?: number | 'end', deleteText?: string | number | boolean) => {
       if (col) {
-        if (col > lineLength || col === lineLength && !isLastLine)
-          throw new Error(`Edit column ${col} is out of bounds for line ${lineCount}`);
+        if (col === 'end')
+          col = lineLength;
+        else if (col > lineLength)
+          throw new Error(`Edit column ${col} is out of bounds for line ${srcLineCount}`);
         else if (col < 0) {
           const oCol = col;
           col += lineLength;
           if (col < 0)
-            throw new Error(`Edit column ${oCol} is out of bounds for line ${lineCount}`);
+            throw new Error(`Edit column ${oCol} is out of bounds for line ${srcLineCount}`);
         }
       } else
         col = 0;
-      if (deleteCount) {
-        if (deleteCount < 0) {
-          const oDeleteCount = deleteCount;
-          deleteCount += lineLength - col;
-          if (deleteCount < 0)
-            throw new Error(`Edit deleteCount ${oDeleteCount} is out of negative bound for line ${lineCount}`);
+      if (deleteText) {
+        if (deleteText === true)
+          deleteText = Infinity;
+        else if (typeof deleteText === 'number' && deleteText < 0) {
+          const deleteCount = deleteText;
+          deleteText += lineLength - col;
+          if (deleteText < 0)
+            throw new Error(`Edit delete text count ${deleteCount} is out of negative bound for line ${srcLineCount}`);
         }
       } else
-        deleteCount = 0;
-      return { col, deleteCount };
+        deleteText = 0;
+      return { col, deleteText };
     };
 
-    let hasEditLine = false;
-    let maxLine = 0;
+    let hasChange = false;
+    let maxEditLine = 0;
+    let lastLineEnding;
     for (const lineNumber of editMap.keys()) {
-      if (!hasEditLine && lineNumber === 1)
-        hasEditLine = true;
-      if (lineNumber > maxLine)
-        maxLine = lineNumber;
+      if (!hasChange && lineNumber === 1)
+        hasChange = true;
+      if (lineNumber > maxEditLine)
+        maxEditLine = lineNumber;
     }
     while (true) {
       const result = await fileHandle.read(chunk, 0, chunk.length, offset);
@@ -462,84 +490,121 @@ export async function editFile(
       if (!offset) {
         const nullPos = bytes.indexOf(0);
         if (nullPos !== -1)
-          notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled - use read_media_file for images or audio.`);
+          notes.push(`The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled.`);
       }
       const text = decoder.decode(bytes);
 
       let chunkLineCount = 0;
-      let firstLineBreakPos, lastLineBreakPos;
+      let end;
       for (let i = 0; i < text.length; i++)
-        if (text[i] === '\n') {
-          chunkLineCount++;
-          if (firstLineBreakPos === undefined)
-            firstLineBreakPos = i;
-          lastLineBreakPos = i;
+        if (text[i] === '\n' || text[i] === '\r') {
+          end = i + 1;
+          if (text[i] === '\n' && text[i - 1] !== '\r' || text[i] === '\r')
+            chunkLineCount++;
         }
       if (chunkLineCount) {
-        hasEditLine = false;
+        hasChange = false;
         for (const lineNumber of editMap.keys())
-          if (lineCount <= lineNumber && lineCount + chunkLineCount > lineNumber) {
-            hasEditLine = true;
+          if (srcLineCount <= lineNumber && srcLineCount + chunkLineCount > lineNumber) {
+            hasChange = true;
             break;
           }
-        if (hasEditLine) {
-          const completeLines = (pendingLine + text.slice(0, lastLineBreakPos)).split('\n');
-          for (let line of completeLines) {
-            line += '\n';
-            if (editMap.has(lineCount)) {
-              const edit = editMap.get(lineCount)!;
-              let newLine = '';
-              const { col, deleteCount } = formatColAndDeleteCount(line.length, false, edit.col, edit.deleteCount);
-              newLine = line.slice(0, col);
-              if (edit.text)
-                newLine += edit.text;
-              newLine += line.slice(col + deleteCount);
-              modified.push({ line: lineCount, text: newLine });
+        if (hasChange) {
+          const completeLines = (pendingLine + text.slice(0, end)).split(/(\r\n|\n|\r)/);
+          for (let i = 0; i < completeLines.length - 1; i += 2) {
+            const line = completeLines[i];
+            const lineEnding = completeLines[i + 1];
+            const edit = editMap.get(srcLineCount);
+            if (edit) {
+              modified.push({ type: '-', line: srcLineCount, text: line });
+              if (!edit.delete) {
+                let newLine = '';
+                const { col, deleteText } = formatColAndDeleteCount(line.length, edit.col, edit.deleteText);
+                newLine = line.slice(0, col);
+                if (edit.text)
+                  newLine += edit.text;
+                if (typeof deleteText === 'number')
+                  newLine += line.slice(col + deleteText);
+                else
+                  newLine += line.slice(col).replace(deleteText, '');
+                const lines = newLine.split(/(\r\n|\n|\r)/);
+                for (let i = 0; i < lines.length; i += 2) {
+                  if (
+                    // If the text starts with \n and lastLineEnding is \r, they are combined to a line terminator
+                    lastLineEnding === '\r' && !i && !lines[i] && lines[i + 1] === '\n' ||
+                    // If the text ends with \r and lineEnding is \n, they are combined to a line terminator
+                    lines[i - 1] === '\r' && i === lines.length - 1 && !lines[i] && lineEnding === '\n'
+                  )
+                    continue;
+                  modified.push({ type: '+', line: distLineCount, text: lines[i] });
+                  distLineCount++;
+                }
+                newLine += lineEnding;
+                if (outFileHandle)
+                  await outFileHandle.appendFile(newLine);
+              }
+            } else {
+              distLineCount++;
               if (outFileHandle)
-                await outFileHandle.appendFile(newLine);
-            } else if (outFileHandle)
-              await outFileHandle.appendFile(line);
-            lineCount++;
+                await outFileHandle.appendFile(line + lineEnding);
+            }
+            srcLineCount++;
+            lastLineEnding = lineEnding;
           }
-          hasEditLine = false;
+          hasChange = false;
         } else {
-          lineCount += chunkLineCount;
+          srcLineCount += chunkLineCount;
+          distLineCount += chunkLineCount;
+          lastLineEnding = text[end! - 1];
           if (outFileHandle)
-            await outFileHandle.appendFile(text.slice(0, lastLineBreakPos! + 1));
+            await outFileHandle.appendFile(text.slice(0, end));
         }
         for (const lineNumber of editMap.keys())
-          if (lineCount === lineNumber) {
-            hasEditLine = true;
+          if (srcLineCount === lineNumber) {
+            hasChange = true;
             break;
           }
-        pendingLine = text.slice(lastLineBreakPos! + 1);
-        if (!hasEditLine) {
+        pendingLine = text.slice(end);
+        if (!hasChange) {
           if (outFileHandle)
             await outFileHandle.appendFile(pendingLine);
           pendingLine = '';
         }
       } else {
-        if (hasEditLine)
+        if (hasChange)
           pendingLine += text;
         else if (outFileHandle)
           await outFileHandle.appendFile(bytes);
       }
       offset += result.bytesRead;
     }
-    if (hasEditLine) {
-      const edit = editMap.get(lineCount)!;
-      let newLine = '';
-      const { col, deleteCount } = formatColAndDeleteCount(pendingLine.length, true, edit.col, edit.deleteCount);
-      newLine = pendingLine.slice(0, col);
-      if (edit.text)
-        newLine += edit.text;
-      newLine += pendingLine.slice(col + deleteCount);
-      modified.push({ line: lineCount, text: newLine });
-      if (outFileHandle)
-        await outFileHandle.appendFile(newLine);
+    if (hasChange) {
+      const edit = editMap.get(srcLineCount)!;
+      modified.push({ type: '-', line: srcLineCount, text: pendingLine });
+      if (!edit.delete) {
+        let newLine = '';
+        const { col, deleteText } = formatColAndDeleteCount(pendingLine.length, edit.col, edit.deleteText);
+        newLine = pendingLine.slice(0, col);
+        if (edit.text)
+          newLine += edit.text;
+        if (typeof deleteText === 'number')
+          newLine += pendingLine.slice(col + deleteText);
+        else
+          newLine += pendingLine.slice(col).replace(deleteText, '');
+        const lines = newLine.split(/(\r\n|\n|\r)/);
+        for (let i = 0; i < lines.length; i += 2) {
+          // If the text starts with \n and lastLineEnding is \r, they are combined to a line terminator
+          if (lastLineEnding === '\r' && !i && !lines[i] && lines[i + 1] === '\n')
+            continue;
+          modified.push({ type: '+', line: distLineCount, text: lines[i] });
+          distLineCount++;
+        }
+        if (outFileHandle)
+          await outFileHandle.appendFile(newLine);
+      }
     }
-    if (maxLine > lineCount)
-      notes.push(`The inputted lines with the line number greater than the total lines (${lineCount}) are not processed.`);
+    if (maxEditLine > srcLineCount)
+      notes.push(`Edit lines with line number greater than total lines (${srcLineCount}) are not processed.`);
     const output: FileEditResult = { modified };
     if (notes.length)
       output.note = notes.join('\n');

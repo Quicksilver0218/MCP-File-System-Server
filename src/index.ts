@@ -92,7 +92,7 @@ allowedDirectories = accessibleDirectories;
 setAllowedDirectories(allowedDirectories);
 
 // Schema definitions
-const ReadTextFileArgsSchema = z.object({
+const ReadTextFileArgsSchema = z.strictObject({
   path: z.string().describe(
     'Path of the file to read. Absolute paths are preferred; relative paths are resolved ' +
     'against the allowed directories. Must resolve inside an allowed directory.'
@@ -108,21 +108,30 @@ const ReadTextFileArgsSchema = z.object({
     .optional().describe('Maximum UTF-16 units of line content to return (0-25000, default 25000)')
 });
 
-const EditTextFileArgsSchema = z.object({
+const EditTextFileArgsSchema = z.strictObject({
   path: z.string().describe(
     'Path of the file to edit. Absolute paths are preferred; relative paths are resolved ' +
     'against the allowed directories. Must resolve inside an allowed directory.'
   ),
   edits: z.array(z.object({
     line: z.number().int().min(1, 'line must be >= 1 (lines are 1-indexed)').describe('1-indexed line number to edit'),
-    col: z.number().int().optional().describe(
+    delete: z.boolean().optional().describe('If true, delete the line and ignore col, text and deleteText.'),
+    col: z.union([
+      z.number().int(),
+      z.enum(['end'])
+    ]).optional().describe(
       '0-indexed UTF-16 offset applied to the line. Negative index counts back ' +
-      'from the end of the line (including line breaks). Defaults to 0.'
+      'from the end of the line (including line breaks). Can also input ' +
+      "'end' to represent the end of the line. Defaults to 0."
     ),
     text: z.string().optional().describe('New text to insert at the given position. Optional.'),
-    deleteCount: z.number().int().optional().describe(
-      'Number of characters to delete at the given position. Negative index counts back ' +
-      'from the end of the line (including line breaks). Defaults to 0.'
+    deleteText: z.union([
+      z.number().int(),
+      z.string(),
+      z.boolean()
+    ]).optional().describe(
+      'Specifies deletion behavior: a number sets the character length (negative counts from the end), ' +
+      'a string targets its first occurrence, true represents the maximum length, and false is ignored.'
     )
   })).describe('Edits to apply to the file. Only one edit per line is allowed.'),
   dryRun: z.boolean().optional().describe('If true, do not actually write the file.')
@@ -230,16 +239,15 @@ server.registerTool(
       "Read one text file inside the allowed directories. Use read_multiple_files for several",
       "files at once, and read_media_file for images or audio.",
       "",
-      "Result: a key-value header (fileSize, totalLines, plus truncatedAt/next/note when",
+      "Result: a key-value header (fileSize, totalLines, plus lineEnding/truncatedAt/next/note when",
       "relevant), then content: each line as an ABSOLUTE 1-indexed number followed by '|' and",
-      "the line's text, preserving original line breaks (empty lines included).",
+      "the line's text (empty lines included).",
+      "- lineEnding: line terminator type in the extracted text, LF, CRLF, or Mixed.",
       "- truncatedAt { line, col, lineLength } + next { startLine, startCol }: set when maxSize",
-      "  cut the payload short; pass next back verbatim to resume, until next is absent. col and",
-      "  lineLength count the line terminator too, so a stop can land inside CRLF; resuming from",
-      "  there yields a line number with no text.",
+      "  cut the payload short; pass next back verbatim to resume, until next is absent.",
       "- note: why the result needs explaining, e.g. startLine past EOF or a binary file.",
       "",
-      "maxSize (0-25000, default 25000) counts UTF-16 units of line content with terminators and",
+      "maxSize (0-25000, default 25000) counts UTF-16 units of line content without terminators and",
       "only caps the payload; the file is still scanned to EOF, so totalLines is exact. Prefer",
       "ranges over huge files. Errors: path outside allowed dirs, missing, a directory, or",
       "endLine < startLine."
@@ -250,17 +258,16 @@ server.registerTool(
   async (args: z.infer<typeof ReadTextFileArgsSchema>) => {
     const validPath = await validatePath(args.path);
 
-    if (args.startLine && args.endLine && args.endLine < args.startLine)
-      throw new Error("endLine must be greater than or equal to startLine");
-
     const result = await readFile(validPath, args);
     let text = `fileSize: ${result.fileSize}\ntotalLines: ${result.totalLines}\n`;
     const JsonStringifyWithoutKeyQuotes = (obj: unknown) => JSON.stringify(obj).replace(/"([^"]+)"\s*:/g, ' $1: ').replace(/}/, ' }');
+    if (result.lineEnding)
+      text += `lineEnding: ${result.lineEnding}\n`;
     if (result.truncatedAt)
       text += `truncatedAt: ${JsonStringifyWithoutKeyQuotes(result.truncatedAt)}\nnext: ${JsonStringifyWithoutKeyQuotes(result.next)}\n`;
     if (result.note)
       text += `note: ${result.note}\n`;
-    text += `content:\n${result.lines.map((line, i) => `${i + (args.startLine ?? 1)}|${line}`).join('')}`;
+    text += `content:\n${result.lines.map((line, i) => `${i + (args.startLine ?? 1)}|${line}`).join('\n')}`;
 
     return {
       content: [{ type: "text" as const, text }]
@@ -275,7 +282,7 @@ server.registerTool(
     description:
       "Apply line-based edits (insert text and/or delete deleteCount chars) to a text file; " +
       "lines past EOF are skipped. " +
-      "Result: modified lines as <line_number>|<json_escaped_text>, plus note when relevant.",
+      "Result: modified lines as <+ or -><line_number>|<text>, plus note when relevant.",
     inputSchema: EditTextFileArgsSchema,
     annotations: { destructiveHint: true, openWorldHint: false }
   },
@@ -283,7 +290,7 @@ server.registerTool(
     const validPath = await validatePath(args.path);
 
     const result = await editFile(validPath, args.edits, args.dryRun);
-    let text = `modified:\n${result.modified.sort((a, b) => a.line - b.line).map(item => `${item.line}|${JSON.stringify(item.text).slice(1, -1)}`).join('\n')}`;
+    let text = `modified:\n${result.modified.sort((a, b) => a.line - b.line).map(item => `${item.type}${item.line}|${item.text}`).join('\n')}`;
     if (result.note)
       text += `\nnote: ${result.note}`;
 
