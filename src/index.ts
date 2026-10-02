@@ -97,7 +97,7 @@ allowedDirectories = accessibleDirectories;
 setAllowedDirectories(allowedDirectories);
 
 // Schema definitions
-const ReadTextFileArgsSchema = z.strictObject({
+const ReadTextFileArgsSchema = z.object({
   path: z.string().describe(
     'Path of the file to read. Absolute paths are preferred; relative paths are resolved ' +
     'against the allowed directories. Must resolve inside an allowed directory.'
@@ -113,7 +113,7 @@ const ReadTextFileArgsSchema = z.strictObject({
     .optional().describe('Maximum UTF-16 units of line content to return (0-25000, default 25000)')
 });
 
-const EditTextFileArgsSchema = z.strictObject({
+const EditTextFileArgsSchema = z.object({
   path: z.string().describe(
     'Path of the file to edit. Absolute paths are preferred; relative paths are resolved ' +
     'against the allowed directories. Must resolve inside an allowed directory.'
@@ -159,12 +159,16 @@ const WriteFileArgsSchema = z.object({
 });
 
 const EditFileArgsSchema = z.object({
-  path: z.string(),
+  path: z.string().describe('Path of the file to edit; must resolve inside an allowed directory. Prefer absolute paths.'),
   edits: z.array(z.object({
-    oldText: z.string().describe('Text to search for - must match exactly'),
-    newText: z.string().describe('Text to replace with')
-  })),
-  dryRun: z.boolean().default(false).describe('Preview changes using git-style diff format')
+    oldText: z.string().describe(
+      'Exact text to find (may span lines). Only its first occurrence is replaced, so add ' +
+      'context to make it unique; falls back to whitespace-insensitive line matching that ' +
+      'preserves indentation.'
+    ),
+    newText: z.string().describe('Replacement text; may be empty to delete the match.')
+  })).describe('Applied in order; if any oldText is not found the call fails and the file is unchanged.'),
+  dryRun: z.boolean().default(false).describe('Preview the git-style diff without writing.')
 });
 
 const CreateDirectoryArgsSchema = z.object({
@@ -301,21 +305,20 @@ registerTool(
   {
     title: "Read Text File",
     description: [
-      "Read one text file inside the allowed directories. Use read_multiple_files for several",
+      "Read one text file inside the allowed directories. Use read_multiple_files for several " +
       "files at once, and read_media_file for images or audio.",
       "",
-      "Result: a key-value header (fileSize, totalLines, plus lineEnding/truncatedAt/next/note when",
-      "relevant), then content: each line as an ABSOLUTE 1-indexed number followed by '|' and",
+      "Result: a key-value header (fileSize, totalLines, plus lineEnding/truncatedAt/next/note when " +
+      "relevant), then content: each line as an ABSOLUTE 1-indexed number followed by '|' and " +
       "the line's text (empty lines included).",
       "- lineEnding: line terminator type in the extracted text, LF, CRLF, or Mixed.",
-      "- truncatedAt { line, col, lineLength } + next { startLine, startCol }: set when maxSize",
-      "  cut the payload short; pass next back verbatim to resume, until next is absent.",
+      "- truncatedAt { line, col, lineLength } + next { startLine, startCol }: set when maxSize " +
+      "cut the payload short; pass next back verbatim to resume, until next is absent.",
       "- note: why the result needs explaining, e.g. startLine past EOF or a binary file.",
       "",
-      "maxSize (0-25000, default 25000) counts UTF-16 units of line content without terminators and",
-      "only caps the payload; the file is still scanned to EOF, so totalLines is exact. Prefer",
-      "ranges over huge files. Errors: path outside allowed dirs, missing, a directory, or",
-      "endLine < startLine."
+      "maxSize (0-25000, default 25000) counts UTF-16 units of line content without terminators and " +
+      "only caps the payload; the file is still scanned to EOF, so totalLines is exact. Prefer " +
+      "ranges over huge files."
     ].join('\n'),
     inputSchema: ReadTextFileArgsSchema,
     annotations: { readOnlyHint: true, openWorldHint: false }
@@ -345,9 +348,14 @@ registerTool(
   {
     title: "Edit Text File",
     description:
-      "Apply line-based edits (insert text and/or delete deleteCount chars) to a text file; " +
-      "lines past EOF are skipped. " +
-      "Result: modified lines as <+ or -><line_number>|<text>, plus note when relevant.",
+      "Line/column-addressed edits: each edit targets one 1-indexed line (duplicates " +
+      "rejected) to insert text, delete characters, or delete the whole line; lines past " +
+      "EOF are skipped, original line endings preserved. Use when you know exact positions " +
+      "(e.g. from read_text_file); if you only know the text to change, use edit_file " +
+      "instead (search-and-replace returning a git-style diff). " +
+      "Result: modified lines as <sign><line_number>|<text>, where '-' rows give the " +
+      "BEFORE-edit line number (old text) and '+' rows the AFTER-edit line number (new " +
+      "text); a note is appended when relevant.",
     inputSchema: EditTextFileArgsSchema,
     annotations: { destructiveHint: true, openWorldHint: false }
   },
@@ -355,7 +363,7 @@ registerTool(
     const validPath = await validatePath(args.path);
 
     const result = await editFile(validPath, args.edits, args.dryRun);
-    let text = `modified:\n${result.modified.sort((a, b) => a.line - b.line).map(item => `${item.type}${item.line}|${item.text}`).join('\n')}`;
+    let text = `modified:${result.modified.sort((a, b) => a.line - b.line).map(item => `\n${item.type}${item.line}|${item.text}`).join('')}`;
     if (result.note)
       text += `\nnote: ${result.note}`;
 
@@ -496,8 +504,14 @@ registerTool(
   {
     title: "Edit File",
     description:
-      "Make line-based edits to a text file. Each edit replaces exact line sequences " +
-      "with new content. Returns a git-style diff showing the changes made.",
+      "Search-and-replace edits addressed by CONTENT, not line numbers: find oldText and " +
+      "replace it with newText. Use when you know WHAT to change but not WHERE; use " +
+      "edit_text_file when you have exact line/column positions (it returns modified lines " +
+      "instead of a diff). Edits apply in order; only the first occurrence of oldText is " +
+      "replaced, so include context to make it unique (whitespace-insensitive line matching " +
+      "is the fallback). If oldText is not found the call fails and the file is unchanged. " +
+      "Returns a git-style diff; dryRun previews without writing. Write is atomic and " +
+      "normalizes line endings to LF.",
     inputSchema: EditFileArgsSchema,
     outputSchema: { content: z.string() },
     annotations: { destructiveHint: true, openWorldHint: false }
