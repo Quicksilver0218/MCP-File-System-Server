@@ -798,7 +798,6 @@ export async function applyFileEdits(
 export async function searchFilesWithValidation(
   rootPath: string,
   pattern: string,
-  allowedDirectories: string[],
   options: SearchOptions = {}
 ): Promise<string[]> {
   const { excludePatterns = [] } = options;

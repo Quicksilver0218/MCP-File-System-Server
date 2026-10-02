@@ -138,7 +138,7 @@ const EditTextFileArgsSchema = z.object({
       'Specifies deletion behavior: a number sets the character length (negative counts from the end), ' +
       'a string targets its first occurrence, true represents the maximum length, and false is ignored.'
     )
-  })).describe('Edits to apply to the file. Only one edit per line is allowed.'),
+  })).min(1, "At least one edit must be provided").describe('Edits to apply to the file. Only one edit per line is allowed.'),
   dryRun: z.boolean().optional().describe('If true, do not actually write the file.')
 });
 
@@ -170,6 +170,14 @@ const EditFileArgsSchema = z.object({
   })).describe('Applied in order; if any oldText is not found the call fails and the file is unchanged.'),
   dryRun: z.boolean().default(false).describe('Preview the git-style diff without writing.')
 });
+
+const RemoveFilesArgsSchema = z.object({
+  paths: z
+    .array(z.string())
+    .min(1, "At least one file path must be provided")
+    .describe("Array of file paths to remove. Each path must be a string pointing to a valid file within allowed directories."),
+  recursive: z.boolean().optional().describe("If true, remove files and directories recursively.")
+})
 
 const CreateDirectoryArgsSchema = z.object({
   path: z.string(),
@@ -527,6 +535,45 @@ registerTool(
 );
 
 registerTool(
+  "remove_files",
+  {
+    title: "Remove Files",
+    description:
+      "Permanently delete each path - no trash, no undo. Paths are processed independently " +
+      "and reported as 'succeed: N' / 'failed: N' with per-path error messages, so partial " +
+      "success is possible. Directories are only removed when recursive: true (covers " +
+      "non-empty trees); otherwise directory paths fail. Use move_file to relocate instead " +
+      "of deleting.",
+    inputSchema: RemoveFilesArgsSchema,
+    annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof RemoveFilesArgsSchema>) => {
+    const succeed: string[] = [];
+    const failed: { path: string; error: Error }[] = [];
+    for (const path of args.paths)
+      try {
+        const validPath = await validatePath(path);
+        await fs.rm(validPath, { recursive: args.recursive ?? false });
+        succeed.push(path);
+      } catch (e) {
+        failed.push({ path, error: e as Error });
+      }
+
+    let text = '';
+    if (succeed.length)
+      text += `succeed: ${succeed.length}\n${succeed.join("\n")}`
+    if (failed.length) {
+      if (text)
+        text += "\n\n"
+      text += `failed: ${failed.length}\n${failed.map(({ path, error }) => `${path}: ${error.message}`).join("\n")}`
+    }
+    return {
+      content: [{ type: "text" as const, text }]
+    };
+  }
+);
+
+registerTool(
   "create_directory",
   {
     title: "Create Directory",
@@ -759,7 +806,7 @@ registerTool(
   },
   async (args: z.infer<typeof SearchFilesArgsSchema>) => {
     const validPath = await validatePath(args.path);
-    const results = await searchFilesWithValidation(validPath, args.pattern, allowedDirectories, { excludePatterns: args.excludePatterns });
+    const results = await searchFilesWithValidation(validPath, args.pattern, { excludePatterns: args.excludePatterns });
     const text = results.length > 0 ? results.join("\n") : "No matches found";
     return {
       content: [{ type: "text" as const, text }],
