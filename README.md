@@ -43,4 +43,4 @@ A fork of https://github.com/modelcontextprotocol/servers/tree/main/src/filesyst
 - directory_tree
 - search_files
 - get_file_info
-- list_allowed_directories
+- list_allowed_paths

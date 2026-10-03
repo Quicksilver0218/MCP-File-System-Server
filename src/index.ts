@@ -17,7 +17,6 @@ import { minimatch } from "minimatch";
 import { normalizePath, expandHome } from './path-utils';
 import { getValidRootDirectories } from './roots-utils';
 import {
-  // Function imports
   formatSize,
   validatePath,
   getFileStats,
@@ -27,90 +26,67 @@ import {
   moveFile,
   searchFilesWithValidation,
   applyFileEdits,
-  setAllowedDirectories,
+  setAllowedPaths,
   editFile,
   searchText,
-  setForbiddenDirectories,
+  setForbiddenPaths,
 } from './lib.js';
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 
 // Command line argument parsing
 const args = process.argv.slice(2);
-if (args.length === 0) {
-  console.error("Usage: file-system-mcp-server [allowed-directory] [additional-directories...]");
-  console.error("Note: Allowed directories can be provided via:");
+if (!args.length) {
+  console.error("Usage: file-system-mcp-server [allowed-directory] [additional-paths...]");
+  console.error("Note: Allowed paths can be provided via:");
   console.error("  1. Command-line arguments (shown above)");
   console.error("  2. MCP roots protocol (if client supports it)");
   console.error("At least one directory must be provided by EITHER method for the server to operate.");
 }
 
-// Store allowed directories in normalized and resolved form
+// Store allowed paths in normalized and resolved form
 // We store BOTH the original path AND the resolved path to handle symlinks correctly
 // This fixes the macOS /tmp -> /private/tmp symlink issue where users specify /tmp
 // but the resolved path is /private/tmp
-let allowedDirectories: string[] = [];
-let forbiddenDirectories: string[] = [];
+let allowedPaths = new Set<string>();
+let forbiddenPaths = new Set<string>();
 await Promise.all(
   args.map(async (arg) => {
-    let directories;
+    let paths;
     let dir;
     if (arg.startsWith("+")) {
-      directories = allowedDirectories;
+      paths = allowedPaths;
       dir = arg.slice(1);
     } else if (arg.startsWith("-")) {
-      directories = forbiddenDirectories;
+      paths = forbiddenPaths;
       dir = arg.slice(1);
     } else {
-      directories = allowedDirectories;
+      paths = allowedPaths;
       dir = arg;
     }
     const expanded = expandHome(dir);
     const absolute = path.resolve(expanded);
     const normalizedOriginal = normalizePath(absolute);
     if (!path.isAbsolute(normalizedOriginal))
-      throw new Error('Directories must be absolute paths after normalization');
-    directories.push(normalizedOriginal);
+      throw new Error('Paths must be absolute paths after normalization');
+    paths.add(normalizedOriginal);
     try {
-      // Security: Resolve symlinks in allowed directories during startup
+      // Security: Resolve symlinks in allowed paths during startup
       // This ensures we know the real paths and can validate against them later
       const resolved = await fs.realpath(absolute);
       const normalizedResolved = normalizePath(resolved);
       if (!path.isAbsolute(normalizedResolved))
-        throw new Error('Directories must be absolute paths after normalization');
+        throw new Error('Paths must be absolute paths after normalization');
       // Return both original and resolved paths if they differ
       // This allows matching against either /tmp or /private/tmp on macOS
       if (normalizedOriginal !== normalizedResolved)
-        directories.push(normalizedResolved);
+        paths.add(normalizedResolved);
     } catch { }
   })
 );
 
-// Filter to only accessible directories, warn about inaccessible ones
-const accessibleDirectories: string[] = [];
-for (const dir of allowedDirectories) {
-  try {
-    const stats = await fs.stat(dir);
-    if (stats.isDirectory()) {
-      accessibleDirectories.push(dir);
-    } else {
-      console.error(`Warning: ${dir} is not a directory, skipping`);
-    }
-  } catch {
-    console.error(`Warning: Cannot access directory ${dir}, skipping`);
-  }
-}
-
-// Exit only if ALL paths are inaccessible (and some were specified)
-if (accessibleDirectories.length === 0 && allowedDirectories.length > 0) {
-  console.error("Error: None of the specified directories are accessible");
-  process.exit(1);
-}
-
-allowedDirectories = accessibleDirectories;
-
-// Initialize the global allowedDirectories in lib.ts
-setAllowedDirectories(allowedDirectories);
-setForbiddenDirectories(forbiddenDirectories);
+// Initialize the global allowedPaths in lib.ts
+setAllowedPaths(allowedPaths);
+setForbiddenPaths(forbiddenPaths);
 
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
@@ -166,7 +142,7 @@ const ReadMultipleFilesArgsSchema = z.object({
   paths: z
     .array(z.string())
     .min(1, "At least one file path must be provided")
-    .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed directories."),
+    .describe("Array of file paths to read. Each path must be a string pointing to a valid file within allowed paths."),
 });
 
 const WriteFileArgsSchema = z.object({
@@ -214,7 +190,7 @@ const RemoveFilesArgsSchema = z.object({
   paths: z
     .array(z.string())
     .min(1, "At least one file path must be provided")
-    .describe("Array of file paths to remove. Each path must be a string pointing to a valid file within allowed directories."),
+    .describe("Array of file paths to remove. Each path must be a string pointing to a valid file within allowed paths."),
   recursive: z.boolean().optional().describe("If true, remove files and directories recursively.")
 })
 
@@ -261,8 +237,8 @@ const server = new McpServer(
     // Shared conventions for every tool, stated once instead of repeating them in every
     // tool description. Clients that surface `instructions` pass this to the model.
     instructions:
-      "All tools operate only inside the configured allowed directories " +
-      "(see list_allowed_directories) and report failures as tool errors. Prefer absolute " +
+      "All tools operate only inside the configured allowed paths " +
+      "(see list_allowed_paths) and report failures as tool errors. Prefer absolute " +
       "paths; relative paths are resolved against the allowed directories.",
   }
 );
@@ -817,8 +793,11 @@ registerTool(
         };
 
         if (entry.isDirectory()) {
-          const subPath = path.join(currentPath, entry.name);
-          entryData.children = await buildTree(subPath, excludePatterns);
+          try {
+            await validatePath(relativePath);
+            const subPath = path.join(currentPath, entry.name);
+            entryData.children = await buildTree(subPath, excludePatterns);
+          } catch { }
         }
 
         result.push(entryData);
@@ -879,7 +858,7 @@ registerTool(
   async (args: z.infer<typeof SearchFilesArgsSchema>) => {
     const validPath = await validatePath(args.path);
     const results = await searchFilesWithValidation(validPath, args.pattern, { excludePatterns: args.excludePatterns });
-    const text = results.length > 0 ? results.join("\n") : "No matches found";
+    const text = results.length ? results.join("\n") : "No matches found";
     return {
       content: [{ type: "text" as const, text }],
       structuredContent: { content: text }
@@ -914,12 +893,12 @@ registerTool(
 );
 
 registerTool(
-  "list_allowed_directories",
+  "list_allowed_paths",
   {
-    title: "List Allowed Directories",
+    title: "List Allowed Paths",
     description:
-      "Returns the list of directories that this server is allowed to access. " +
-      "Subdirectories within these allowed directories are also accessible. " +
+      "Returns the list of file or directory paths that this server is allowed to access. " +
+      "Subdirectories within these allowed paths are also accessible. " +
       "Use this to understand which directories and their nested paths are available " +
       "before trying to access files.",
     inputSchema: {},
@@ -927,9 +906,9 @@ registerTool(
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
   async () => {
-    let text = `Allowed directories:${allowedDirectories.map(dir => `\n${dir}`).join('')}`;
-    if (forbiddenDirectories.length)
-      text += `\n\nForbidden directories:${forbiddenDirectories.map(dir => `\n${dir}`).join('')}`;
+    let text = `Allowed paths:${[...allowedPaths].map(dir => `\n${dir}`).join('')}`;
+    if (forbiddenPaths.size)
+      text += `\n\nForbidden paths:${[...forbiddenPaths].map(dir => `\n${dir}`).join('')}`;
     return {
       content: [{ type: "text" as const, text }],
       structuredContent: { content: text }
@@ -937,25 +916,25 @@ registerTool(
   }
 );
 
-// Updates allowed directories based on MCP client roots
-async function updateAllowedDirectoriesFromRoots(requestedRoots: Root[]) {
+// Updates allowed paths based on MCP client roots
+async function updateAllowedPathsFromRoots(requestedRoots: Root[]) {
   const validatedRootDirs = await getValidRootDirectories(requestedRoots);
-  if (validatedRootDirs.length > 0) {
-    allowedDirectories = [...validatedRootDirs];
-    setAllowedDirectories(allowedDirectories); // Update the global state in lib.ts
-    console.error(`Updated allowed directories from MCP roots: ${validatedRootDirs.length} valid directories`);
+  if (validatedRootDirs.length) {
+    allowedPaths = new Set(validatedRootDirs);
+    setAllowedPaths(allowedPaths); // Update the global state in lib.ts
+    console.error(`Updated allowed paths from MCP roots: ${validatedRootDirs.length} valid directories`);
   } else {
-    console.error("No valid root directories provided by client");
+    console.error("No valid root paths provided by client");
   }
 }
 
-// Handles dynamic roots updates during runtime, when client sends "roots/list_changed" notification, server fetches the updated roots and replaces all allowed directories with the new roots.
+// Handles dynamic roots updates during runtime, when client sends "roots/list_changed" notification, server fetches the updated roots and replaces all allowed paths with the new roots.
 server.server.setNotificationHandler(RootsListChangedNotificationSchema, async () => {
   try {
     // Request the updated roots list from the client
     const response = await server.server.listRoots();
     if (response && 'roots' in response) {
-      await updateAllowedDirectoriesFromRoots(response.roots);
+      await updateAllowedPathsFromRoots(response.roots);
     }
   } catch (error) {
     console.error("Failed to request roots from client:", error instanceof Error ? error.message : String(error));
@@ -970,7 +949,7 @@ server.server.oninitialized = async () => {
     try {
       const response = await server.server.listRoots();
       if (response && 'roots' in response) {
-        await updateAllowedDirectoriesFromRoots(response.roots);
+        await updateAllowedPathsFromRoots(response.roots);
       } else {
         console.error("Client returned no roots set, keeping current settings");
       }
@@ -978,10 +957,10 @@ server.server.oninitialized = async () => {
       console.error("Failed to request initial roots from client:", error instanceof Error ? error.message : String(error));
     }
   } else {
-    if (allowedDirectories.length > 0) {
-      console.error("Client does not support MCP Roots, using allowed directories set from server args:", allowedDirectories);
+    if (allowedPaths.size) {
+      console.error("Client does not support MCP Roots, using allowed paths set from server args:", allowedPaths);
     } else {
-      throw new Error(`Server cannot operate: No allowed directories available. Server was started without command-line directories and client either does not support MCP roots protocol or provided empty roots. Please either: 1) Start server with directory arguments, or 2) Use a client that supports MCP roots protocol and provides valid root directories.`);
+      throw new Error(`Server cannot operate: No allowed paths available. Server was started without command-line paths and client either does not support MCP roots protocol or provided empty roots. Please either: 1) Start server with directory arguments, or 2) Use a client that supports MCP roots protocol and provides valid root directories.`);
     }
   }
 };
@@ -991,8 +970,8 @@ async function runServer() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.log("Secure File System MCP Filesystem Server running on stdio");
-  if (allowedDirectories.length === 0) {
-    console.log("Started without allowed directories - waiting for client to provide roots via MCP protocol");
+  if (!allowedPaths.size) {
+    console.log("Started without allowed paths - waiting for client to provide roots via MCP protocol");
   }
 }
 
