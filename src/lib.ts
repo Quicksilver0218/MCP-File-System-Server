@@ -4,19 +4,19 @@ import { randomBytes } from 'crypto';
 import { createTwoFilesPatch } from 'diff';
 import { minimatch } from 'minimatch';
 import { normalizePath, expandHome } from './path-utils.js';
-import { isPathWithinAllowedDirectories } from './path-validation.js';
+import { isPathAllowed } from './path-validation.js';
 
 // Global allowed directories - set by the main module
 let allowedDirectories: string[] = [];
+let forbiddenDirectories: string[] = [];
 
 // Function to set allowed directories from the main module
 export function setAllowedDirectories(directories: string[]): void {
   allowedDirectories = [...directories];
 }
 
-// Function to get current allowed directories
-export function getAllowedDirectories(): string[] {
-  return [...allowedDirectories];
+export function setForbiddenDirectories(directories: string[]): void {
+  forbiddenDirectories = [...directories];
 }
 
 // Type definitions
@@ -84,7 +84,7 @@ function resolveRelativePathAgainstAllowedDirectories(relativePath: string): str
     const normalizedCandidate = normalizePath(candidate);
 
     // Check if the resulting path lies within any allowed directory
-    if (isPathWithinAllowedDirectories(normalizedCandidate, allowedDirectories)) {
+    if (isPathAllowed(normalizedCandidate, allowedDirectories, forbiddenDirectories)) {
       return candidate;
     }
   }
@@ -98,7 +98,7 @@ function resolveRelativePathAgainstAllowedDirectories(relativePath: string): str
 async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<string> {
   const allowedDirectory = [...allowedDirectories]
     .sort((left, right) => right.length - left.length)
-    .find(directory => isPathWithinAllowedDirectories(normalizePath(absolutePath), [directory]));
+    .find(directory => isPathAllowed(normalizePath(absolutePath), [directory], forbiddenDirectories));
 
   if (!allowedDirectory) {
     return absolutePath;
@@ -127,7 +127,7 @@ async function resolveUnicodeEquivalentPath(absolutePath: string): Promise<strin
     }
 
     currentPath = await fs.realpath(path.join(currentPath, equivalentMatches[0]));
-    if (!isPathWithinAllowedDirectories(normalizePath(currentPath), allowedDirectories)) {
+    if (!isPathAllowed(normalizePath(currentPath), allowedDirectories, forbiddenDirectories)) {
       throw new Error(`Access denied - symlink target outside allowed directories: ${currentPath} not in ${allowedDirectories.join(', ')}`);
     }
   }
@@ -150,7 +150,7 @@ export async function validatePath(requestedPath: string): Promise<string> {
   const normalizedRequested = normalizePath(absolute);
 
   // Security: Check if path is within allowed directories before any file operations
-  const isAllowed = isPathWithinAllowedDirectories(normalizedRequested, allowedDirectories);
+  const isAllowed = isPathAllowed(normalizedRequested, allowedDirectories, forbiddenDirectories);
   if (!isAllowed) {
     throw new Error(`Access denied - path outside allowed directories: ${absolute} not in ${allowedDirectories.join(', ')}`);
   }
@@ -160,7 +160,7 @@ export async function validatePath(requestedPath: string): Promise<string> {
   try {
     const realPath = await fs.realpath(absolute);
     const normalizedReal = normalizePath(realPath);
-    if (!isPathWithinAllowedDirectories(normalizedReal, allowedDirectories)) {
+    if (!isPathAllowed(normalizedReal, allowedDirectories, forbiddenDirectories)) {
       throw new Error(`Access denied - symlink target outside allowed directories: ${realPath} not in ${allowedDirectories.join(', ')}`);
     }
     return realPath;

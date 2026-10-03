@@ -30,6 +30,7 @@ import {
   setAllowedDirectories,
   editFile,
   searchText,
+  setForbiddenDirectories,
 } from './lib.js';
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 
@@ -47,29 +48,42 @@ if (args.length === 0) {
 // We store BOTH the original path AND the resolved path to handle symlinks correctly
 // This fixes the macOS /tmp -> /private/tmp symlink issue where users specify /tmp
 // but the resolved path is /private/tmp
-let allowedDirectories = (await Promise.all(
-  args.map(async (dir) => {
+let allowedDirectories: string[] = [];
+let forbiddenDirectories: string[] = [];
+await Promise.all(
+  args.map(async (arg) => {
+    let directories;
+    let dir;
+    if (arg.startsWith("+")) {
+      directories = allowedDirectories;
+      dir = arg.slice(1);
+    } else if (arg.startsWith("-")) {
+      directories = forbiddenDirectories;
+      dir = arg.slice(1);
+    } else {
+      directories = allowedDirectories;
+      dir = arg;
+    }
     const expanded = expandHome(dir);
     const absolute = path.resolve(expanded);
     const normalizedOriginal = normalizePath(absolute);
+    if (!path.isAbsolute(normalizedOriginal))
+      throw new Error('Directories must be absolute paths after normalization');
+    directories.push(normalizedOriginal);
     try {
       // Security: Resolve symlinks in allowed directories during startup
       // This ensures we know the real paths and can validate against them later
       const resolved = await fs.realpath(absolute);
       const normalizedResolved = normalizePath(resolved);
+      if (!path.isAbsolute(normalizedResolved))
+        throw new Error('Directories must be absolute paths after normalization');
       // Return both original and resolved paths if they differ
       // This allows matching against either /tmp or /private/tmp on macOS
-      if (normalizedOriginal !== normalizedResolved) {
-        return [normalizedOriginal, normalizedResolved];
-      }
-      return [normalizedResolved];
-    } catch {
-      // If we can't resolve (doesn't exist), use the normalized absolute path
-      // This allows configuring allowed dirs that will be created later
-      return [normalizedOriginal];
-    }
+      if (normalizedOriginal !== normalizedResolved)
+        directories.push(normalizedResolved);
+    } catch { }
   })
-)).flat();
+);
 
 // Filter to only accessible directories, warn about inaccessible ones
 const accessibleDirectories: string[] = [];
@@ -96,6 +110,7 @@ allowedDirectories = accessibleDirectories;
 
 // Initialize the global allowedDirectories in lib.ts
 setAllowedDirectories(allowedDirectories);
+setForbiddenDirectories(forbiddenDirectories);
 
 // Schema definitions
 const ReadTextFileArgsSchema = z.object({
@@ -912,7 +927,9 @@ registerTool(
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
   async () => {
-    const text = `Allowed directories:\n${allowedDirectories.join('\n')}`;
+    let text = `Allowed directories:${allowedDirectories.map(dir => `\n${dir}`).join('')}`;
+    if (forbiddenDirectories.length)
+      text += `\n\nForbidden directories:${forbiddenDirectories.map(dir => `\n${dir}`).join('')}`;
     return {
       content: [{ type: "text" as const, text }],
       structuredContent: { content: text }

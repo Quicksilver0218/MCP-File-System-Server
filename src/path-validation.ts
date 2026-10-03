@@ -1,5 +1,9 @@
 import path from 'path';
 
+function isPathWithinForbiddenDirectories(normalizedPath: string, forbiddenDirectories: string[]): boolean {
+  return forbiddenDirectories.some(f => normalizedPath === f || normalizedPath.startsWith(f + path.sep));
+}
+
 /**
  * Checks if an absolute path is within any of the allowed directories.
  * 
@@ -8,7 +12,7 @@ import path from 'path';
  * @returns true if the path is within an allowed directory, false otherwise
  * @throws Error if given relative paths after normalization
  */
-export function isPathWithinAllowedDirectories(absolutePath: string, allowedDirectories: string[]): boolean {
+export function isPathAllowed(absolutePath: string, allowedDirectories: string[], forbiddenDirectories: string[]): boolean {
   // Type validation
   if (typeof absolutePath !== 'string' || !Array.isArray(allowedDirectories)) {
     return false;
@@ -48,39 +52,27 @@ export function isPathWithinAllowedDirectories(absolutePath: string, allowedDire
       return false;
     }
 
-    // Normalize the allowed directory
-    let normalizedDir: string;
-    try {
-      normalizedDir = path.resolve(path.normalize(dir));
-    } catch {
-      return false;
-    }
-
-    // Verify allowed directory is absolute after normalization
-    if (!path.isAbsolute(normalizedDir)) {
-      throw new Error('Allowed directories must be absolute paths after normalization');
-    }
-
     // Check if normalizedPath is within normalizedDir
     // Path is inside if it's the same or a subdirectory
-    if (normalizedPath === normalizedDir) {
-      return true;
+    if (normalizedPath === dir) {
+      return !isPathWithinForbiddenDirectories(normalizedPath, forbiddenDirectories);
     }
     
     // Special case for root directory to avoid double slash
     // On Windows, we need to check if both paths are on the same drive
-    if (normalizedDir === path.sep) {
-      return normalizedPath.startsWith(path.sep);
+    if (dir === path.sep) {
+      return normalizedPath.startsWith(path.sep) && !isPathWithinForbiddenDirectories(normalizedPath, forbiddenDirectories);
     }
     
     // On Windows, also check for drive root (e.g., "C:\")
-    if (path.sep === '\\' && normalizedDir.match(/^[A-Za-z]:\\?$/)) {
+    if (path.sep === '\\' && dir.match(/^[A-Za-z]:\\?$/)) {
       // Ensure both paths are on the same drive
-      const dirDrive = normalizedDir.charAt(0).toLowerCase();
+      const dirDrive = dir.charAt(0).toLowerCase();
       const pathDrive = normalizedPath.charAt(0).toLowerCase();
-      return pathDrive === dirDrive && normalizedPath.startsWith(normalizedDir.replace(/\\?$/, '\\'));
+      return pathDrive === dirDrive && normalizedPath.startsWith(dir.replace(/\\?$/, '\\')) &&
+        !isPathWithinForbiddenDirectories(normalizedPath, forbiddenDirectories);
     }
     
-    return normalizedPath.startsWith(normalizedDir + path.sep);
+    return normalizedPath.startsWith(dir + path.sep) && !isPathWithinForbiddenDirectories(normalizedPath, forbiddenDirectories);
   });
 }
