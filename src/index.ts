@@ -29,6 +29,7 @@ import {
   applyFileEdits,
   setAllowedDirectories,
   editFile,
+  searchText,
 } from './lib.js';
 import { ZodRawShapeCompat, AnySchema } from "@modelcontextprotocol/sdk/server/zod-compat";
 
@@ -170,6 +171,29 @@ const EditFileArgsSchema = z.object({
   })).describe('Applied in order; if any oldText is not found the call fails and the file is unchanged.'),
   dryRun: z.boolean().default(false).describe('Preview the git-style diff without writing.')
 });
+
+const SearchTextInFileArgsSchema = z.object({
+  path: z.string().describe(
+    'Path of the file to search; must resolve inside an allowed directory. Prefer absolute paths.'
+  ),
+  pattern: z.string().describe(
+    'JavaScript RegExp (flags g and m, plus i unless caseSensitive). Escape metacharacters ' +
+    'for a literal search; an invalid pattern fails the call.'
+  ),
+  maxResults: z.number().int()
+    .min(1, 'maxResults must be >= 1')
+    .max(100, 'maxResults must be <= 100').optional()
+    .describe(
+      'Maximum matches to return (1-100, default 100). The cap is not flagged, so page with ' +
+      'skip when more may exist.'
+    ),
+  skip: z.number().int().min(0).optional().describe(
+    'Matches to discard from the start of the file, applied before maxResults.'
+  ),
+  caseSensitive: z.boolean().optional().describe(
+    'Case-sensitive matching. Defaults to false.'
+  )
+})
 
 const RemoveFilesArgsSchema = z.object({
   paths: z
@@ -530,6 +554,39 @@ registerTool(
     return {
       content: [{ type: "text" as const, text: result }],
       structuredContent: { content: result }
+    };
+  }
+);
+
+registerTool(
+  "search_text_in_file",
+  {
+    title: "Search Text in File",
+    description: [
+      "Search one file for a pattern and report each match's position. pattern is a JavaScript " +
+      "RegExp (flags g, m, plus i unless caseSensitive); escape metacharacters for a literal " +
+      "search.",
+      "",
+      "Result: 'matches: <n>' (returned count, not total), then one line per match " +
+      "<line>:<col>|<json_escaped_text> - line 1-indexed, col 0-indexed UTF-16 within the line, " +
+      "text JSON-escaped without outer quotes. 'note: ...' is appended when relevant (NUL byte " +
+      "= binary). Empty result is 'matches: 0'. maxResults (default 100, applied after skip) " +
+      "is not flagged when hit, so page with skip. Use search_files to find files, " +
+      "read_text_file to read around a match."
+    ].join('\n'),
+    inputSchema: SearchTextInFileArgsSchema,
+    annotations: { readOnlyHint: true, openWorldHint: false }
+  },
+  async (args: z.infer<typeof SearchTextInFileArgsSchema>) => {
+    const validPath = await validatePath(args.path);
+
+    const result = await searchText(validPath, args.pattern, args);
+    let text = `matches: ${result.results.length}` +
+      result.results.map(r => `\n${r.line}:${r.col}|${JSON.stringify(r.text).slice(1, -1)}`).join('');
+    if (result.note)
+      text += `\nnote: ${result.note}`;
+    return {
+      content: [{ type: "text" as const, text }]
     };
   }
 );

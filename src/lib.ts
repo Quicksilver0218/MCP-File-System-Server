@@ -795,6 +795,102 @@ export async function applyFileEdits(
   return formattedDiff;
 }
 
+export interface TextSearchResult {
+  results: { line: number; col: number; text: string }[];
+  note?: string;
+}
+
+export async function searchText(
+  filePath: string,
+  pattern: string,
+  options: { maxResults?: number; skip?: number; caseSensitive?: boolean } = {}
+): Promise<TextSearchResult> {
+  const { maxResults = 100, caseSensitive = false } = options;
+  let { skip = 0 } = options;
+  let flags = 'gm';
+  if (!caseSensitive)
+    flags += 'i';
+  const regex = new RegExp(pattern, flags);
+  const fileHandle = await fs.open(filePath, 'r');
+  try {
+    const chunk = Buffer.alloc(65536); // 64KB
+    const decoder = new TextDecoder();
+    const results: { line: number; col: number; text: string }[] = [];
+    let note;
+
+    const readResult = await fileHandle.read(chunk, 0, chunk.length, 0);
+    if (readResult.bytesRead === 0) // Empty file
+      return { results };
+    const bytes = chunk.subarray(0, readResult.bytesRead);
+    const nullPos = bytes.indexOf(0);
+    if (nullPos !== -1)
+      note = `The file appears to be binary (NUL byte found at offset ${nullPos}); the text may be garbled.`;
+    let lastText = decoder.decode(bytes);
+    let offset = readResult.bytesRead;
+    let lineCount = 1;
+    let lastCol = 0;
+    while (true) {
+      const result = await fileHandle.read(chunk, 0, chunk.length, offset);
+      const bytes = chunk.subarray(0, result.bytesRead);
+      const text = decoder.decode(bytes);
+      const fullText = lastText + text;
+      const textToSearch = fullText.slice(0, Math.max(fullText.lastIndexOf('\n'), fullText.lastIndexOf('\r')) + 1);
+      const tokens = textToSearch.split(/(\r\n|\r|\n)/);
+      let index = 0;
+      let lineStart = 0;
+      let lineLength = tokens[index].length + tokens[index + 1].length;
+      const matches = Array.from(textToSearch.matchAll(regex));
+      for (const match of matches) {
+        while (lineStart + lineLength <= match.index) {
+          lineStart += lineLength;
+          index += 2;
+          lineCount++;
+          lastCol = 0;
+          lineLength = tokens[index].length + tokens[index + 1].length;
+        }
+        if (skip)
+          skip--;
+        else {
+          results.push({ line: lineCount, col: lastCol + match.index - lineStart, text: match[0] });
+          if (results.length === maxResults)
+            break;
+        }
+      }
+      if (matches.length) {
+        const match = matches[matches.length - 1];
+        const continuePos = match.index + match[0].length;
+        while (lineStart + lineLength <= continuePos) {
+          lineStart += lineLength;
+          index += 2;
+          lineCount++;
+          lineLength = tokens[index].length + tokens[index + 1].length;
+        }
+        lastCol = continuePos - lineStart;
+        lastText = fullText.slice(continuePos);
+        if (match[0].endsWith('\r') && lastText.startsWith('\n'))
+          lineCount--;
+      } else {
+        const lines = lastText.split(/\r\n|\r|\n/);
+        lineCount += lines.length - 1;
+        if (lastText.endsWith('\r') && text.startsWith('\n'))
+          lineCount--;
+        lastCol = 0;
+        lastText = lines[lines.length - 1] + text;
+      }
+
+      if (result.bytesRead === 0) break; // End of file
+      offset += result.bytesRead;
+    }
+
+    const result: TextSearchResult = { results };
+    if (note)
+      result.note = note;
+    return result;
+  } finally {
+    fileHandle.close();
+  }
+}
+
 export async function searchFilesWithValidation(
   rootPath: string,
   pattern: string,
